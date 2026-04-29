@@ -1,29 +1,26 @@
 // ============================================================
-// HK MACRO ENGINE — V15.2b  (SERVER ONLY)
-// Updated weights:
-//   VHSI (volatility)      25%
-//   Southbound flow        20%
-//   HSI + HSTECH trends    20%
-//   USD/HKD peg            15%
-//   HK breadth             10%
-//   HIBOR 1M               10%
-//
-// Fixes:
-//   Southbound: Yahoo ETF volume proxy (primary) + EastMoney (secondary)
-//   HIBOR: HKMA correct field names + Yahoo ^IRX proxy fallback
+// HK MACRO ENGINE — V15.2c  (SERVER ONLY)
+// Weights: VHSI 25% · Southbound 20% · HSI/Tech 20%
+//          USD/HKD 15% · Breadth 10% · HIBOR 10%
+// Southbound: reads from GitHub-hosted southbound_data.json
+//             (updated by southbound_fetch.py, pushed to repo)
 // ============================================================
 
 import { HKMacroData, MacroFactor, MacroHeadline, hkMbsLabel } from "./macro-types";
 export type { HKMacroData };
 
 const W = {
-  vhsi:       0.25,
+  vhsi:       0.20,
   southbound: 0.20,
-  hsiTrends:  0.20,
+  hsiTrends:  0.25,
   usdHkd:     0.15,
   breadth:    0.10,
   hibor:      0.10,
 };
+
+// ── GitHub raw URL — update branch/path if needed ────────────
+const SOUTHBOUND_JSON_URL =
+  "https://raw.githubusercontent.com/sc4stock-pixel/trading-ta-dashboard/main/public/southbound_data.json";
 
 // ── Yahoo helpers ─────────────────────────────────────────────
 async function fetchYahooClose(symbol: string): Promise<number | null> {
@@ -51,7 +48,7 @@ async function fetchYahooSeries(symbol: string, days = 25): Promise<number[]> {
   } catch { return []; }
 }
 
-async function fetchYahooOHLCV(symbol: string, days = 10): Promise<{ close: number; volume: number }[]> {
+async function fetchYahooOHLCV(symbol: string, days = 25): Promise<{ close: number; volume: number }[]> {
   try {
     const end   = Math.floor(Date.now() / 1000);
     const start = end - days * 86400 * 2;
@@ -73,7 +70,7 @@ async function fetchYahooOHLCV(symbol: string, days = 10): Promise<{ close: numb
   } catch { return []; }
 }
 
-// ── 1. VHSI — HK Volatility Index ────────────────────────────
+// ── 1. VHSI ──────────────────────────────────────────────────
 async function getVHSI(): Promise<MacroFactor> {
   try {
     const vhsi = await fetchYahooClose("^VHSI");
@@ -102,114 +99,71 @@ async function getVHSI(): Promise<MacroFactor> {
 }
 
 // ── 2. Southbound Flow ────────────────────────────────────────
-// Strategy:
-//   Primary A: Yahoo Finance ETF volume proxy
-//     - 2800.HK (Tracker Fund) volume surge vs 20d avg = mainland buying signal
-//     - 3033.HK (HSTECH ETF) relative volume vs 2800.HK momentum
-//   Primary B: EastMoney push2 API (correct secid = 90.BK0002 for southbound)
-//   Secondary: Price momentum of 3033.HK vs ^HSI (HSTECH outperforms = risk-on)
+// Primary:  GitHub-hosted southbound_data.json
+// Fallback: Yahoo 2800.HK volume proxy
 async function getSouthboundFlow(): Promise<MacroFactor> {
 
-  // ── Source A: EastMoney southbound net flow (primary when accessible) ──
-  // BK0002 = "港股通(沪深)" — combined SH+SZ southbound board
-  const emUrls = [
-    // Daily kline net flow endpoint
-    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?lmt=10&klt=101&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56&ut=b2884a393a59ad64002292a3e90d46a5&secid=90.BK0002",
-    // Alternative: BK0707 (another southbound aggregate code)
-    "https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?lmt=10&klt=101&fields1=f1,f2,f3,f7&fields2=f51,f52,f53,f54,f55,f56&ut=b2884a393a59ad64002292a3e90d46a5&secid=90.BK0707",
-  ];
-
-  for (const emUrl of emUrls) {
-    try {
-      const res = await fetch(emUrl, {
-        headers: { "User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com/" },
-        cache: "no-store",
-        signal: AbortSignal.timeout(5000),
-      });
-      if (!res.ok) continue;
-      const text = await res.text();
-      // Remove JSONP wrapper if present
-      const jsonStr = text.replace(/^[^{]*/, "").replace(/[^}]*$/, "");
-      const json = JSON.parse(jsonStr || text);
-      const klines: string[] = json?.data?.klines ?? [];
-      if (klines.length < 3) continue;
-
-      // kline format: "date,f52(main large),f53(main small),f54(retail large),f55(retail small),f56(net)"
-      // f52 = today net main force flow (+ = inflow to HK)
-      const recentFlows: number[] = [];
-      for (const k of klines.slice(-5)) {
-        const parts = k.split(",");
-        // Try column index 2 (net flow column, in 元)
-        const flow = parseFloat(parts[2] ?? "0") / 1e8; // convert to 亿
-        if (!isNaN(flow)) recentFlows.push(flow);
-      }
-      if (recentFlows.length < 3) continue;
-
-      const todayFlow = recentFlows[recentFlows.length - 1];
-      const flow5d    = recentFlows.reduce((a, b) => a + b, 0);
-      const score  = flow5d >= 50 ? 9 : flow5d >= 20 ? 8 : flow5d >= 5 ? 6 : flow5d >= -5 ? 5 : flow5d >= -20 ? 3 : 2;
-      const signal: MacroFactor["signal"] = flow5d >= 10 ? "bullish" : flow5d <= -10 ? "bearish" : "neutral";
-      const todayStr = todayFlow >= 0 ? `+${todayFlow.toFixed(1)}` : `${todayFlow.toFixed(1)}`;
-      const cumStr   = flow5d    >= 0 ? `+${flow5d.toFixed(1)}`    : `${flow5d.toFixed(1)}`;
-      return {
-        label: "Southbound", value: `${todayStr}亿`,
-        score, signal, detail: `Today ${todayStr} · 5d ${cumStr}亿 CNY`,
-      };
-    } catch { /* try next */ }
-  }
-
-  // ── Source B: Yahoo Finance ETF volume proxy ──────────────────
-  // 2800.HK (Tracker Fund) = best proxy for mainland buying sentiment
-  // High volume relative to 20d avg + positive price = southbound inflow
+  // ── Primary: GitHub JSON ──────────────────────────────────
   try {
-    const [tracker, hstech] = await Promise.all([
-      fetchYahooOHLCV("2800.HK", 25),
-      fetchYahooOHLCV("3033.HK", 25),
-    ]);
+    const res = await fetch(SOUTHBOUND_JSON_URL, {
+      headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
+      cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) throw new Error(`GitHub ${res.status}`);
+    const json = await res.json();
 
-    if (tracker.length < 21) throw new Error("insufficient tracker data");
+    const todayYi: number | null = json?.net_buy_today_yi ?? null;
+    const fiveDYi: number | null = json?.net_buy_5d_yi    ?? null;
+    const dateStr: string        = json?.date ?? "";
 
-    // Compute 20-day average volume for 2800.HK
+    if (todayYi === null) throw new Error("missing net_buy_today_yi");
+
+    // Staleness check
+    const dataDate = dateStr ? new Date(dateStr) : null;
+    const daysDiff = dataDate
+      ? (Date.now() - dataDate.getTime()) / 86400000
+      : 99;
+    const staleNote = daysDiff > 1.5 ? ` (${Math.floor(daysDiff)}d old)` : "";
+
+    const score =
+      todayYi >=  50 ? 9 : todayYi >=  20 ? 8 : todayYi >=  5 ? 6 :
+      todayYi >=  -5 ? 5 : todayYi >= -20 ? 3 : 2;
+    const signal: MacroFactor["signal"] =
+      todayYi >=  5 ? "bullish" :
+      todayYi <= -5 ? "bearish" : "neutral";
+
+    const fmt = (v: number) => (v >= 0 ? `+${v.toFixed(2)}` : `${v.toFixed(2)}`);
+    const fiveDStr = fiveDYi != null ? fmt(fiveDYi) : "—";
+
+    return {
+      label: "Southbound",
+      value: `${fmt(todayYi)}亿`,
+      score, signal,
+      detail: `Today ${fmt(todayYi)} · 5d ${fiveDStr}亿${staleNote}`,
+    };
+  } catch { /* fall through */ }
+
+  // ── Fallback: Yahoo 2800.HK volume proxy ─────────────────
+  try {
+    const tracker = await fetchYahooOHLCV("2800.HK", 25);
+    if (tracker.length < 21) throw new Error("insufficient");
     const vols20   = tracker.slice(-21, -1).map(b => b.volume);
     const avgVol20 = vols20.reduce((a, b) => a + b, 0) / vols20.length;
-    const todayVol  = tracker[tracker.length - 1].volume;
-    const volRatio  = avgVol20 > 0 ? todayVol / avgVol20 : 1;
-
-    // Price momentum: 5d return of 2800.HK vs 10d return
-    const close5d  = tracker.length >= 6  ? tracker[tracker.length - 6].close  : tracker[0].close;
-    const close10d = tracker.length >= 11 ? tracker[tracker.length - 11].close : tracker[0].close;
-    const ret5d    = close5d  > 0 ? (tracker[tracker.length - 1].close - close5d)  / close5d  * 100 : 0;
-    const ret10d   = close10d > 0 ? (tracker[tracker.length - 1].close - close10d) / close10d * 100 : 0;
-
-    // HSTECH relative strength vs Tracker (HSTECH outperforming = tech risk-on = southbound buying)
-    let hstechRelStr = 0;
-    if (hstech.length >= 6) {
-      const hs5d = hstech[hstech.length - 6].close;
-      const hstechRet5 = hs5d > 0 ? (hstech[hstech.length - 1].close - hs5d) / hs5d * 100 : 0;
-      hstechRelStr = hstechRet5 - ret5d; // HSTECH outperformance vs Tracker
-    }
-
-    // Composite signal: vol surge + price momentum + tech relative strength
-    const bull = [
-      volRatio > 1.3,       // above-average volume
-      ret5d > 0,            // positive 5d return
-      ret10d > 0,           // positive 10d return
-      hstechRelStr > 0,     // HSTECH outperforming
-    ].filter(Boolean).length;
-
-    const score  = bull >= 4 ? 9 : bull === 3 ? 7 : bull === 2 ? 5 : bull === 1 ? 3 : 2;
-    const signal: MacroFactor["signal"] = bull >= 3 ? "bullish" : bull <= 1 ? "bearish" : "neutral";
-    const volStr = volRatio >= 1 ? `Vol ${volRatio.toFixed(1)}x avg` : `Vol ${volRatio.toFixed(1)}x avg`;
-
+    const volRatio = avgVol20 > 0 ? tracker[tracker.length - 1].volume / avgVol20 : 1;
+    const close5d  = tracker.length >= 6 ? tracker[tracker.length - 6].close : tracker[0].close;
+    const ret5d    = close5d > 0 ? (tracker[tracker.length - 1].close - close5d) / close5d * 100 : 0;
+    const score    = volRatio > 1.5 && ret5d > 0 ? 7 : ret5d > 0 ? 6 : ret5d < 0 ? 3 : 5;
+    const signal: MacroFactor["signal"] = ret5d > 1 ? "bullish" : ret5d < -1 ? "bearish" : "neutral";
     return {
       label: "Southbound",
       value: `${ret5d >= 0 ? "+" : ""}${ret5d.toFixed(1)}%`,
       score, signal,
-      detail: `2800.HK ${volStr} · 5d ${ret5d >= 0 ? "+" : ""}${ret5d.toFixed(1)}%`,
+      detail: `2800.HK vol ${volRatio.toFixed(1)}x · 5d ${ret5d >= 0 ? "+" : ""}${ret5d.toFixed(1)}% (proxy — push JSON to update)`,
     };
-  } catch { /* fall through */ }
+  } catch { /* ignore */ }
 
-  return { label: "Southbound", value: "—", score: 5, signal: "neutral", detail: "unavailable" };
+  return { label: "Southbound", value: "—", score: 5, signal: "neutral", detail: "run southbound_fetch.py & push" };
 }
 
 // ── 3. HSI & HSTECH Trends ────────────────────────────────────
@@ -219,8 +173,9 @@ async function getHSITrends(): Promise<MacroFactor> {
       fetchYahooSeries("^HSI", 22),
       fetchYahooSeries("^HSTECH", 22),
     ]);
-    const trend20 = (s: number[]) => s.length < 5 ? 0 : (s[s.length - 1] - s[0]) / s[0] * 100;
-    const ema10   = (s: number[]) => {
+    const trend20 = (s: number[]) =>
+      s.length < 5 ? 0 : (s[s.length - 1] - s[0]) / s[0] * 100;
+    const ema10 = (s: number[]) => {
       if (!s.length) return 0;
       const a = 2 / 11; let e = s[0];
       for (let i = 1; i < s.length; i++) e = a * s[i] + (1 - a) * e;
@@ -230,11 +185,11 @@ async function getHSITrends(): Promise<MacroFactor> {
     const hstechT     = trend20(hstechSeries);
     const hsiAbove    = hsiSeries.length    > 0 && hsiSeries[hsiSeries.length - 1]       > ema10(hsiSeries);
     const hstechAbove = hstechSeries.length > 0 && hstechSeries[hstechSeries.length - 1] > ema10(hstechSeries);
-    const bull        = [hsiT > 0, hstechT > 0, hsiAbove, hstechAbove].filter(Boolean).length;
-    const score       = bull === 4 ? 9 : bull === 3 ? 7 : bull === 2 ? 5 : bull === 1 ? 3 : 2;
+    const bull  = [hsiT > 0, hstechT > 0, hsiAbove, hstechAbove].filter(Boolean).length;
+    const score = bull === 4 ? 9 : bull === 3 ? 7 : bull === 2 ? 5 : bull === 1 ? 3 : 2;
     const signal: MacroFactor["signal"] = bull >= 3 ? "bullish" : bull <= 1 ? "bearish" : "neutral";
-    const hsiStr    = hsiSeries.length    > 0 ? `HSI${hsiT >= 0 ? "+" : ""}${hsiT.toFixed(1)}%`       : "HSI—";
-    const hstechStr = hstechSeries.length > 0 ? `Tech${hstechT >= 0 ? "+" : ""}${hstechT.toFixed(1)}%` : "Tech—";
+    const hsiStr    = `HSI${hsiT >= 0 ? "+" : ""}${hsiT.toFixed(1)}%`;
+    const hstechStr = `Tech${hstechT >= 0 ? "+" : ""}${hstechT.toFixed(1)}%`;
     return { label: "HSI/HSTECH", value: `${bull}/4 bull`, score, signal, detail: `${hsiStr} ${hstechStr}` };
   } catch {
     return { label: "HSI/HSTECH", value: "—", score: 5, signal: "neutral", detail: "unavailable" };
@@ -249,19 +204,11 @@ async function getUSDHKD(): Promise<MacroFactor> {
     let score: number;
     let signal: MacroFactor["signal"];
     let detail: string;
-    if (rate >= 7.75 && rate <= 7.77) {
-      score = 8; signal = "bullish"; detail = "Strong side (ideal)";
-    } else if (rate > 7.77 && rate <= 7.80) {
-      score = 7; signal = "bullish"; detail = "Mid-band (stable)";
-    } else if (rate > 7.80 && rate <= 7.83) {
-      score = 5; signal = "neutral"; detail = "Upper-mid (watch)";
-    } else if (rate > 7.83 && rate <= 7.85) {
-      score = 3; signal = "bearish"; detail = "Weak side (pressure)";
-    } else if (rate > 7.85) {
-      score = 1; signal = "bearish"; detail = "Above peg ceiling";
-    } else {
-      score = 6; signal = "neutral"; detail = "Below floor (HKMA)";
-    }
+    if      (rate <= 7.77) { score = 8; signal = "bullish"; detail = "Strong side (ideal)"; }
+    else if (rate <= 7.80) { score = 7; signal = "bullish"; detail = "Mid-band (stable)"; }
+    else if (rate <= 7.83) { score = 5; signal = "neutral"; detail = "Upper-mid (watch)"; }
+    else if (rate <= 7.85) { score = 3; signal = "bearish"; detail = "Weak side (pressure)"; }
+    else                   { score = 1; signal = "bearish"; detail = "Above peg ceiling"; }
     return { label: "USD/HKD Peg", value: rate.toFixed(4), score, signal, detail };
   } catch {
     return { label: "USD/HKD Peg", value: "—", score: 5, signal: "neutral", detail: "unavailable" };
@@ -273,14 +220,9 @@ async function getHKBreadth(): Promise<MacroFactor> {
   try {
     const symbols = [
       "^HSI", "^HSTECH",
-      "2800.HK",  // Tracker Fund
-      "3033.HK",  // CSOP HSTECH ETF
-      "9988.HK",  // Alibaba
-      "0700.HK",  // Tencent
-      "1211.HK",  // BYD
-      "1810.HK",  // Xiaomi
-      "0005.HK",  // HSBC
-      "0941.HK",  // China Mobile
+      "2800.HK", "3033.HK",
+      "9988.HK", "0700.HK", "1211.HK", "1810.HK",
+      "0005.HK", "0941.HK",
     ];
     const seriesArr = await Promise.all(symbols.map(s => fetchYahooSeries(s, 25)));
     let above = 0, total = 0;
@@ -301,45 +243,29 @@ async function getHKBreadth(): Promise<MacroFactor> {
 }
 
 // ── 6. HIBOR 1M ───────────────────────────────────────────────
-// Strategy:
-//   Primary A: HKMA public API (correct field: hibor_1m)
-//   Primary B: HKAB scrape (regex on rate table)
-//   Fallback:  Yahoo Finance ^IRX (US 13-week T-bill) as proxy
-//              HK HIBOR tracks Fed Funds closely due to peg
 async function getHIBOR(): Promise<MacroFactor> {
-
-  // ── Source A: HKMA daily interbank liquidity API ──────────────
-  // Correct endpoint with actual field names
+  // Source A: HKMA API
   const hkmaEndpoints = [
-    // Daily monetary stats — has overnight, 1w, 1m HIBOR
     "https://api.hkma.gov.hk/public/market-data-and-statistics/daily-monetary-statistics/daily-figures-interbank-liquidity?pagesize=5&sortby=end_of_date&sortorder=desc",
-    // Monthly statistical bulletin — has hibor series
     "https://api.hkma.gov.hk/public/market-data-and-statistics/monthly-statistical-bulletin/money/interest-rates-in-hong-kong?pagesize=3&sortby=end_of_date&sortorder=desc",
   ];
-
   for (const url of hkmaEndpoints) {
     try {
       const res = await fetch(url, {
         headers: { "User-Agent": "Mozilla/5.0", "Accept": "application/json" },
-        cache: "no-store",
-        signal: AbortSignal.timeout(6000),
+        cache: "no-store", signal: AbortSignal.timeout(6000),
       });
       if (!res.ok) continue;
       const json = await res.json();
       const records: Array<Record<string, unknown>> = json?.result?.records ?? [];
       if (!records.length) continue;
       const rec = records[0];
-      // Try all known field name variants for 1M HIBOR
-      const fieldNames = [
-        "hibor_1m", "hibor_1m_fixing", "one_month", "1m",
-        "hibor_1month", "interbank_1m", "rate_1m",
-      ];
+      const fields = ["hibor_1m", "hibor_1m_fixing", "one_month", "1m", "hibor_1month", "rate_1m"];
       let rate: number | null = null;
-      for (const field of fieldNames) {
-        const val = parseFloat(String(rec[field] ?? ""));
-        if (!isNaN(val) && val > 0 && val < 30) { rate = val; break; }
+      for (const f of fields) {
+        const v = parseFloat(String(rec[f] ?? ""));
+        if (!isNaN(v) && v > 0 && v < 30) { rate = v; break; }
       }
-      // Also check all numeric fields if named ones failed
       if (rate === null) {
         for (const [key, val] of Object.entries(rec)) {
           if (key.toLowerCase().includes("1m") || key.toLowerCase().includes("month")) {
@@ -352,27 +278,18 @@ async function getHIBOR(): Promise<MacroFactor> {
     } catch { /* try next */ }
   }
 
-  // ── Source B: HKAB website scrape ────────────────────────────
-  const hkabUrls = [
-    "https://www.hkab.org.hk/hibor/listHibor.do",
-    "https://www.hkab.org.hk/en/market-information/hong-kong-interbank-offered-rate",
-  ];
-  for (const hkabUrl of hkabUrls) {
-    try {
-      const res = await fetch(hkabUrl, {
-        headers: { "User-Agent": "Mozilla/5.0", "Accept": "text/html,application/xhtml+xml" },
-        cache: "no-store",
-        signal: AbortSignal.timeout(6000),
-      });
-      if (!res.ok) continue;
+  // Source B: HKAB scrape
+  try {
+    const res = await fetch("https://www.hkab.org.hk/hibor/listHibor.do", {
+      headers: { "User-Agent": "Mozilla/5.0" }, cache: "no-store",
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) {
       const html = await res.text();
-      // Multiple regex patterns to handle different HTML structures
       const patterns = [
         /1\s*[Mm]onth[^<]*<\/td>\s*<td[^>]*>\s*(\d+\.\d+)/,
         /1M[^<]*<\/td>\s*<td[^>]*>\s*(\d+\.\d+)/,
         />1\s*Month<\/[^>]+>\s*<[^>]+>\s*(\d+\.\d+)/,
-        /hibor.*?1.*?month.*?(\d+\.\d{4,})/i,
-        /(\d+\.\d{4,})\s*%?\s*<\/td>[\s\S]{0,200}1.Month/i,
       ];
       for (const re of patterns) {
         const m = re.exec(html);
@@ -381,30 +298,21 @@ async function getHIBOR(): Promise<MacroFactor> {
           if (!isNaN(rate) && rate > 0 && rate < 30) return scoreHIBOR(rate, "HKAB");
         }
       }
-    } catch { /* try next */ }
-  }
-
-  // ── Fallback: Yahoo ^IRX (13-week US T-bill) as HIBOR proxy ──
-  // HK HIBOR tracks US rates tightly due to peg; IRX ≈ HIBOR O/N
-  // 1M HIBOR ≈ IRX * 1.05 (slight premium due to HK credit)
-  try {
-    const irx = await fetchYahooClose("^IRX");
-    if (irx && irx > 0) {
-      const hiborProxy = irx * 1.05; // approximate 1M HIBOR from US T-bill
-      return scoreHIBOR(hiborProxy, "^IRX proxy");
     }
   } catch { /* ignore */ }
 
-  // ── Last resort: Fed Funds + spread proxy ─────────────────────
+  // Source C: Yahoo ^IRX proxy
   try {
-    // Use EFFR proxy from Yahoo (^TNX = 10yr, not ideal, but better than nothing)
-    // Actually derive from USDHKD positioning: tight peg + high USDHKD = higher HIBOR
+    const irx = await fetchYahooClose("^IRX");
+    if (irx && irx > 0) return scoreHIBOR(irx * 1.05, "^IRX proxy");
+  } catch { /* ignore */ }
+
+  // Source D: USD/HKD peg stress proxy
+  try {
     const usdHkd = await fetchYahooClose("USDHKD=X");
     if (usdHkd) {
-      // Historically: USDHKD closer to 7.85 = tighter liquidity = higher HIBOR
-      const pegStress = (usdHkd - 7.75) / (7.85 - 7.75); // 0=strong side, 1=weak side
-      const impliedHibor = 2.0 + pegStress * 4.0; // rough: 2% at strong side, 6% at weak
-      return scoreHIBOR(impliedHibor, "Peg proxy");
+      const stress = Math.max(0, Math.min(1, (usdHkd - 7.75) / (7.85 - 7.75)));
+      return scoreHIBOR(2.0 + stress * 4.0, "Peg proxy");
     }
   } catch { /* ignore */ }
 
@@ -434,15 +342,12 @@ export async function fetchHKMacroData(): Promise<HKMacroData> {
       breadth.score    * W.breadth    +
       hibor.score      * W.hibor;
 
-    // HK headlines via Yahoo HK RSS
+    // HK headlines
     const headlines: MacroHeadline[] = [];
     try {
-      const feedUrls = [
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=^HSI&region=HK&lang=en-US",
-        "https://feeds.finance.yahoo.com/rss/2.0/headline?s=9988.HK&region=HK&lang=en-US",
-      ];
-      for (const feedUrl of feedUrls) {
+      for (const sym of ["^HSI", "9988.HK"]) {
         try {
+          const feedUrl = `https://feeds.finance.yahoo.com/rss/2.0/headline?s=${encodeURIComponent(sym)}&region=HK&lang=en-US`;
           const res = await fetch(feedUrl, {
             headers: { "User-Agent": "Mozilla/5.0" }, cache: "no-store",
             signal: AbortSignal.timeout(3000),
@@ -452,12 +357,12 @@ export async function fetchHKMacroData(): Promise<HKMacroData> {
           const re = /<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/g;
           let m: RegExpExecArray | null;
           let count = 0;
-          const BULL_KW = ["rise","gain","surge","rally","beat","upgrade","buy","strong","growth","rebound","inflow","positive"];
-          const BEAR_KW = ["fall","drop","plunge","miss","downgrade","sell","weak","risk","outflow","negative","concern","tariff"];
+          const BULL_KW = ["rise","gain","surge","rally","beat","upgrade","buy","strong","growth","rebound","inflow"];
+          const BEAR_KW = ["fall","drop","plunge","miss","downgrade","sell","weak","risk","outflow","concern","tariff"];
           // eslint-disable-next-line no-cond-assign
           while ((m = re.exec(text)) !== null && count < 5) {
             const title = m[1].trim();
-            if (title.length < 8 || title.toLowerCase().includes("yahoo finance")) continue;
+            if (title.length < 8 || title.toLowerCase().includes("yahoo")) continue;
             const t = title.toLowerCase();
             let bull = 0, bear = 0;
             BULL_KW.forEach(k => { if (t.includes(k)) bull++; });
@@ -469,12 +374,11 @@ export async function fetchHKMacroData(): Promise<HKMacroData> {
         } catch { /* ignore */ }
         if (headlines.length >= 6) break;
       }
-    } catch { /* ignore headlines */ }
+    } catch { /* ignore */ }
 
     return {
       mbs: Math.round(mbs * 10) / 10,
       mbsLabel: hkMbsLabel(mbs),
-      // Return factors in the new weight order for UI display
       factors: { vhsi, usdHkd, hsiTrends, southbound, hibor, breadth },
       headlines,
       fetchedAt: new Date().toISOString(),
